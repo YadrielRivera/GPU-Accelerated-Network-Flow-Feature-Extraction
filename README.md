@@ -16,8 +16,27 @@ distributions.
 CUDA for packet/feature kernels; OpenMP for CPU baseline; MPI4Py for distributed PCAP
 batches.
 
+## Pipeline Anatomy
+```
+[ Raw PCAP Files ] 
+       │ (Load & Batch via MPI4Py)
+       ▼
+[ Packet Parsing Kernel (CUDA) ] 
+       │ Extract 5-tuple: (Source IP, Dest IP, Source Port, Dest Port, Protocol)
+       ▼
+[ Parallel Hashing & Grouping ] 
+       │ Resolve collisions & accumulate counts/bytes in GPU Global Memory
+       ▼
+[ Feature Reduction & Computation ] 
+       │ Calculate inter-arrival times, entropy, and flags
+       ▼
+[ Flow Records Output ]
+```
+
 ## Requirements
 [To be determined]
+
+## File Structure
 
 ## Building, Compiling & Running
 
