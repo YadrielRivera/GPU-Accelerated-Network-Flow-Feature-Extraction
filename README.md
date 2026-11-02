@@ -19,7 +19,7 @@ batches.
 ## Pipeline Anatomy
 ```
 [ Raw PCAP Files ] 
-       │ (Load & Batch via MPI4Py)
+       │ (Load & Batch via OpenMPI)
        ▼
 [ Packet Parsing Kernel (CUDA) ] 
        │ Extract 5-tuple: (Source IP, Dest IP, Source Port, Dest Port, Protocol)
@@ -33,8 +33,17 @@ batches.
 [ Flow Records Output ]
 ```
 
+## Pipeline Description
+
+### Loading and Batching
+
+Raw PCAP files from the dataset directory are read and processed for the GPU to digest
+
 ## Requirements
-[To be determined]
+* A Linux-based OS
+* OpenMPI 
+* git lfs - to get PCAP data
+* CUDA and a CUDA-capable GPU (or use provided google colab file)
 
 ## File Structure
 
