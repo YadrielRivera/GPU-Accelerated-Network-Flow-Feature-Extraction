@@ -43,13 +43,14 @@ Raw PCAP files from the dataset directory are read and processed for the GPU to 
 * A Linux-based OS
 * OpenMPI 
 * git lfs - to get PCAP data
-* CUDA and a CUDA-capable GPU (or use provided google colab file)
+* CUDA and a CUDA-capable GPU (or use provided Google Colab file)
 
 ## File Structure
 
 ## Building, Compiling & Running
 
-## Data
+## Dataset
+The PCAP data was obtained from WireShark [SampleCapture](https://wiki.wireshark.org/samplecaptures#sample-captures)
 
 ## Useful Scripts
 
