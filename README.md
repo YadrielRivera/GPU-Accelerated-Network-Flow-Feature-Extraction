@@ -52,6 +52,16 @@ Raw PCAP files from the dataset directory are read and processed for the GPU to 
 ## Dataset
 The PCAP data was obtained from WireShark [SampleCapture](https://wiki.wireshark.org/samplecaptures#sample-captures)
 
+Accepted and processed ethernet types:
+* IPv4
+* ARP 
+* IPv6 
+* VLAN_TAG 
+* PPPoE_DISCOV
+* PPPoE_SESSION 
+* MLPS_UNI 
+* MLPS_MULTI 
+
 ## Useful Scripts
 
 ## A Note to the Reader
