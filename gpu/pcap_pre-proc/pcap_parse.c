@@ -6,6 +6,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#define DATASET_PATH "../../../dataset"
+
 // PCAP global header
 typedef struct {
   uint32_t magic_number;   // number identifying PCAP format
@@ -93,7 +95,7 @@ int PcapRead(char pcap_file[]) {
 }
 
 int DatasetRead(int my_rank, int num_procs) {
-  DIR* pcap_dir = opendir("../../../dataset");
+  DIR* pcap_dir = opendir(DATASET_PATH);
   if (pcap_dir == NULL) {
     perror("Error opening dataset directory");
     return 1;
@@ -109,7 +111,7 @@ int DatasetRead(int my_rank, int num_procs) {
 
     // Only process this file if it belongs to this MPI rank
     if (file_index % num_procs == my_rank) {
-      snprintf(filepath, sizeof(filepath), "../../../dataset/%s",
+      snprintf(filepath, sizeof(filepath), "%s/%s", DATASET_PATH,
                entry->d_name);
       PcapRead(filepath);
     }
