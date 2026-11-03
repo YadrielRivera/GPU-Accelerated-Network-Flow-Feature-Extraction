@@ -2,9 +2,9 @@
 #include <mpi.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
+
 #include <string.h>
-#include <unistd.h>
+
 
 #define DATASET_PATH "../../../dataset"
 
@@ -68,13 +68,13 @@ int PcapRead(char pcap_file[]) {
     // check if we need to resize our packet_offsets array
     if (total_packets >= packet_capacity) {
       packet_capacity = (packet_capacity == 0) ? 1024 : packet_capacity * 2;
-      packet_offsets = realloc(packet_offsets, packet_capacity * sizeof(int));
+      packet_offsets = (int*)realloc(packet_offsets, packet_capacity * sizeof(int));
     }
 
     // check if we need to resize our packet_data byte array
     if (total_data_bytes + data_size > data_capacity) {
       data_capacity = (data_capacity == 0) ? 65536 : data_capacity * 2;
-      packet_data = realloc(packet_data, data_capacity * sizeof(uint8_t));
+      packet_data = (uint8_t*)realloc(packet_data, data_capacity * sizeof(uint8_t));
     }
     // record the starting offset for this packet
     packet_offsets[total_packets] = total_data_bytes;
