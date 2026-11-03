@@ -38,7 +38,7 @@ void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets) {
   uint16_t ethertype = (curr_pkt[12] << 8) | curr_pkt[13];
 
   switch (ethertype) {
-    case IPv4:{
+    case IPv4: {
       const uint8_t* ip_header = curr_pkt + 14;
       uint8_t protocol = ip_header[9];
 
@@ -118,16 +118,16 @@ void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets) {
         }
       }
       if (current_ethertype == IPv4) {
-        const uint8_t* ip_header = cursor;
-        uint8_t hdr_len = (ip_header[0] & 0x0F) * 4;
-        const uint8_t* trnsprt_hdr = ip_header + hdr_len;
+        const uint8_t* ip_hdr = cursor;
+        uint8_t hdr_len = (ip_hdr[0] & 0x0F) * 4;
+        const uint8_t* trnsprt_hdr = ip_hdr + hdr_len;
 
-        uint32_t src_ip =
-            ((uint32_t)ip_header[12] << 24) | ((uint32_t)ip_header[13] << 16) |
-            ((uint32_t)ip_header[14] << 8) | (uint32_t)ip_header[15];
-        uint32_t dst_ip =
-            ((uint32_t)ip_header[16] << 24) | ((uint32_t)ip_header[17] << 16) |
-            ((uint32_t)ip_header[18] << 8) | (uint32_t)ip_header[19];
+        uint32_t src_ip = ((uint32_t)ip_hdr[12] << 24) |
+                          ((uint32_t)ip_hdr[13] << 16) |
+                          ((uint32_t)ip_hdr[14] << 8) | (uint32_t)ip_hdr[15];
+        uint32_t dst_ip = ((uint32_t)ip_hdr[16] << 24) |
+                          ((uint32_t)ip_hdr[17] << 16) |
+                          ((uint32_t)ip_hdr[18] << 8) | (uint32_t)ip_hdr[19];
 
         uint16_t src_port = ((uint16_t)trnsprt_hdr[0] << 8) | trnsprt_hdr[1];
         uint16_t dst_port = ((uint16_t)trnsprt_hdr[2] << 8) | trnsprt_hdr[3];
@@ -140,19 +140,105 @@ void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets) {
       }
       break;
     }
-    case PPPoE_SESSION: {}
-      /*code*/
-      break;
-    case PPPoE_DISCOV: {}
-      /*code*/
-      break;
-    case MLPS_UNI: {}
-      /*code*/
-      break;
-    case MLPS_MULTI: {}
-      /*code*/
-      break;
+    case PPPoE_SESSION: {
+      uint8_t* ses_hdr = curr_pkt + 14;
 
+      uint8_t ver_type = ses_hdr[0];
+      uint8_t code = ses_hdr[1];
+      uint16_t ses_id = ((uint16_t)ses_hdr[2] << 8) | ses_hdr[3];
+      uint16_t len = ((uint16_t)ses_hdr[4] << 8) | ses_hdr[5];
+      uint16_t pproc = ((uint16_t)ses_hdr[6] << 8) | ses_hdr[7];
+
+      const uint8_t* ip_hdr = ses_hdr + 8;
+      // IPv4
+      if (pproc == 0x0021) {
+        uint8_t protocol = ip_hdr[9];
+
+        uint32_t src_ip = ((uint32_t)ip_hdr[12] << 24) |
+                          ((uint32_t)ip_hdr[13] << 16) |
+                          ((uint32_t)ip_hdr[14] << 8) | ((uint32_t)ip_hdr[15]);
+        uint32_t dst_ip = ((uint32_t)ip_hdr[16] << 24) |
+                          ((uint32_t)ip_hdr[17] << 16) |
+                          ((uint32_t)ip_hdr[18] << 8) | ((uint32_t)ip_hdr[19]);
+
+        uint8_t hdr_len = (ip_hdr[0] & 0x0F) * 4;
+        const uint8_t* trnsprt_hdr = ip_hdr + hdr_len;
+
+        uint16_t src_port = ((uint16_t)trnsprt_hdr[0] << 8) | trnsprt_hdr[1];
+        uint16_t dst_port = ((uint16_t)trnsprt_hdr[2] << 8) | trnsprt_hdr[3];
+      }
+      // IPv6
+      if (pproc == 0x0057) {
+        uint8_t next_hdr = ip_hdr[6];
+
+        const uint8_t* src_ipv6 = ip_hdr + 8;
+
+        const uint8_t* dst_ipv6 = ip_hdr + 24;
+
+        const uint8_t* trnsprt_hdr = ip_hdr + 40;
+
+        uint16_t src_port = ((uint16_t)trnsprt_hdr[0] << 8) | trnsprt_hdr[1];
+        uint16_t dst_port = ((uint16_t)trnsprt_hdr[2] << 8) | trnsprt_hdr[3];
+      }
+      break;
+    }
+    case PPPoE_DISCOV: {
+      // parse, but we don't use it because
+      // it wont produce 5-tuples
+      // this section is just to avoid crashing
+      const uint8_t* disc_hdr = curr_pkt + 14;
+
+      uint8_t ver_type = disc_hdr[0];
+      uint8_t code = disc_hdr[1];
+      uint16_t ses_id = ((uint16_t)disc_hdr[2] << 8) |
+                        disc_hdr[3];  // Usually 0x0000 during discovery
+      uint16_t pyld_len = ((uint16_t)disc_hdr[4] << 8) | disc_hdr[5];
+
+      break;
+    }
+    case MLPS_UNI:
+    case MLPS_MULTI: {
+      const uint8_t* cursor = curr_pkt + 14;
+      bool bottom_of_stack = false;
+
+      // Iteratively strip MPLS label stack
+      while (!bottom_of_stack) {
+        uint32_t mpls_entry = ((uint32_t)cursor[0] << 24) |
+                              ((uint32_t)cursor[1] << 16) |
+                              ((uint32_t)cursor[2] << 8) | (uint32_t)cursor[3];
+
+        if (cursor[2] & 0x01) {
+          bottom_of_stack = true;
+        }
+
+        cursor += 4;
+      }
+
+      uint8_t ip_version = cursor[0] >> 4;
+
+      if (ip_version == 4) {
+        const uint8_t* ip_hdr = cursor;
+        uint8_t hdr_len = (ip_hdr[0] & 0x0F) * 4;
+        const uint8_t* trnsprt_hdr = ip_hdr + hdr_len;
+
+        uint32_t src_ip = ((uint32_t)ip_hdr[12] << 24) |
+                          ((uint32_t)ip_hdr[13] << 16) |
+                          ((uint32_t)ip_hdr[14] << 8) | (uint32_t)ip_hdr[15];
+        uint32_t dst_ip = ((uint32_t)ip_hdr[16] << 24) |
+                          ((uint32_t)ip_hdr[17] << 16) |
+                          ((uint32_t)ip_hdr[18] << 8) | (uint32_t)ip_hdr[19];
+
+        uint16_t src_port = ((uint16_t)trnsprt_hdr[0] << 8) | trnsprt_hdr[1];
+        uint16_t dst_port = ((uint16_t)trnsprt_hdr[2] << 8) | trnsprt_hdr[3];
+      } else if (ip_version == 6) {
+        const uint8_t* ipv6_hdr = cursor;
+        const uint8_t* trnsprt_hdr = ipv6_hdr + 40;
+
+        uint16_t src_port = ((uint16_t)trnsprt_hdr[0] << 8) | trnsprt_hdr[1];
+        uint16_t dst_port = ((uint16_t)trnsprt_hdr[2] << 8) | trnsprt_hdr[3];
+      }
+      break;
+    }
     default:
       break;
   }
