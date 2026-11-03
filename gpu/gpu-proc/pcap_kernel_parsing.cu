@@ -1,8 +1,5 @@
-#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
-#include <unistd.h>
 
 #include "../pcap_pre-proc/pcap_parse.c"
 
@@ -25,10 +22,10 @@
 #define ARP_REQ 1
 #define ARP_REP 2
 
-void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets) {
+void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets, int d_total_packets) {
   int th_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (th_idx >= total_packets) {
+  if (th_idx >= d_total_packets) {
     return;
   }
 
@@ -291,7 +288,7 @@ int main(int argc, char* argv[]) {
 
   // call the kernel
   ThreadParsing<<<cuda_block_count, threads_per_block>>>(d_packet_data,
-                                                         d_packet_offsets);
+                                                         d_packet_offsets, total_packets);
 
   cudaError_t kernel_stat = cudaDeviceSynchronize();
   if (kernel_stat != cudaSuccess) {

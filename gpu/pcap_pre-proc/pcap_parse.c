@@ -2,9 +2,9 @@
 #include <mpi.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
+
 #include <string.h>
-#include <unistd.h>
+
 
 #define DATASET_PATH "../../../dataset"
 
