@@ -25,14 +25,17 @@
 // Hashing
 #define HASH_TABLE_SIZE (1 << 20)
 #define HASH_MASK (HASH_TABLE_SIZE - 1)
+#define SLOT_EMPTY   0
+#define SLOT_WRITING 1
+#define SLOT_READY   2
 
 typedef struct __align__(8) {
-  uint32_t locked;
+  uint32_t state;          
   uint32_t src_ip;
   uint32_t dst_ip;
   uint16_t src_port;
   uint16_t dst_port;
-  uint8_t proto;
+  uint8_t  proto;
   uint32_t packet_count;
   uint64_t byte_count;
 } flow_record_t;
@@ -55,48 +58,44 @@ __device__ uint32_t HashTuple(uint32_t src_ip, uint32_t dst_ip,
   return hash;
 }
 
-__device__ void aggregate_flow(flow_record_t* table, uint32_t src_ip,
+__device__ void AggregateFlow(flow_record_t* table, uint32_t src_ip,
                                uint32_t dst_ip, uint16_t src_port,
                                uint16_t dst_port, uint8_t proto,
                                uint32_t pkt_len) {
-  uint32_t hash = HashTuple(src_ip, dst_ip, src_port, dst_port, proto);
-  uint32_t idx = hash & HASH_MASK;
+  uint32_t idx = HashTuple(src_ip, dst_ip, src_port, dst_port, proto) & HASH_MASK;
 
-  while (true) {
-    if (table[idx].src_ip == src_ip && table[idx].dst_ip == dst_ip &&
-        table[idx].src_port == src_port && table[idx].dst_port == dst_port &&
-        table[idx].proto == proto) {
-      // Existing flow found! Atomically update counters
-      atomicAdd(&(table[idx].packet_count), 1);
-      atomicAdd((unsigned long long*)&(table[idx].byte_count),
+  for (uint32_t probes = 0; probes < HASH_TABLE_SIZE; probes++) {
+    flow_record_t* slot = &table[idx];
+    volatile flow_record_t* vslot = slot;
+
+    // Try to claim an empty slot
+    uint32_t prev = atomicCAS(&slot->state, SLOT_EMPTY, SLOT_WRITING);
+
+    if (prev == SLOT_EMPTY) {
+      // We own it: write the key, then publish
+      vslot->src_ip = src_ip;
+      vslot->dst_ip = dst_ip;
+      vslot->src_port = src_port;
+      vslot->dst_port = dst_port;
+      vslot->proto = proto;
+      __threadfence();                       // key visible before READY
+      atomicExch(&slot->state, SLOT_READY);
+    } else {
+      // Someone else owns it wait until their key is fully published
+      while (vslot->state != SLOT_READY) { }
+      __threadfence();
+    }
+
+    // Slot is READY: does the key match?
+    if (vslot->src_ip == src_ip && vslot->dst_ip == dst_ip &&
+        vslot->src_port == src_port && vslot->dst_port == dst_port &&
+        vslot->proto == proto) {
+      atomicAdd(&slot->packet_count, 1);
+      atomicAdd((unsigned long long*)&slot->byte_count,
                 (unsigned long long)pkt_len);
       return;
     }
-
-    // Check if the slot is completely empty (src_ip == 0 and unowned)
-    if (table[idx].src_ip == 0) {
-      // Attempt to acquire the bucket lock via atomicCAS
-      if (atomicCAS(&(table[idx].locked), 0, 1) == 0) {
-        // Double check emptiness after acquiring lock
-        if (table[idx].src_ip == 0) {
-          table[idx].src_ip = src_ip;
-          table[idx].dst_ip = dst_ip;
-          table[idx].src_port = src_port;
-          table[idx].dst_port = dst_port;
-          table[idx].proto = proto;
-          table[idx].packet_count = 1;
-          table[idx].byte_count = pkt_len;
-
-          // Release lock
-          atomicExch(&(table[idx].locked), 0);
-          return;
-        }
-        // Release lock if another thread beat us to it
-        atomicExch(&(table[idx].locked), 0);
-      }
-    }
-    // linear probing
-    idx = (idx + 1) & HASH_MASK;
+    idx = (idx + 1) & HASH_MASK;             // genuinely different flow: probe on
   }
 }
 
@@ -112,7 +111,7 @@ __device__ uint32_t fold_ipv6(const uint8_t* a) {
   return r;
 }
 
-void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets,
+void __global__ PcapParallelParsing(uint8_t* d_packet_data, int* d_packet_offsets,
                               int d_total_packets,
                               flow_record_t* d_flow_table) {
   int th_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -146,7 +145,7 @@ void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets,
 
       uint16_t ip_total_len = ((uint16_t)ip_header[2] << 8) | ip_header[3];
       uint32_t pkt_len = (uint32_t)(ip_header - curr_pkt) + ip_total_len;
-      aggregate_flow(d_flow_table, src_ip, dst_ip, src_port, dst_port, protocol,
+      AggregateFlow(d_flow_table, src_ip, dst_ip, src_port, dst_port, protocol,
                      pkt_len);
 
       break;
@@ -189,7 +188,7 @@ void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets,
       uint16_t ipv6_payload_len = ((uint16_t)ipv6_hdr[4] << 8) | ipv6_hdr[5];
       uint32_t pkt_len =
           (uint32_t)(ipv6_hdr - curr_pkt) + 40 + ipv6_payload_len;
-      aggregate_flow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
+      AggregateFlow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
                      dst_port, next_hdr, pkt_len);
       break;
     }
@@ -236,7 +235,7 @@ void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets,
 
         uint16_t ip_total_len = ((uint16_t)ip_hdr[2] << 8) | ip_hdr[3];
         uint32_t pkt_len = (uint32_t)(ip_hdr - curr_pkt) + ip_total_len;
-        aggregate_flow(d_flow_table, src_ip, dst_ip, src_port, dst_port,
+        AggregateFlow(d_flow_table, src_ip, dst_ip, src_port, dst_port,
                        ip_hdr[9], pkt_len);
 
       } else if (current_ethertype == IPv6) {
@@ -255,7 +254,7 @@ void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets,
         uint16_t ipv6_payload_len = ((uint16_t)ipv6_hdr[4] << 8) | ipv6_hdr[5];
         uint32_t pkt_len =
             (uint32_t)(ipv6_hdr - curr_pkt) + 40 + ipv6_payload_len;
-        aggregate_flow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
+        AggregateFlow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
                        dst_port, ipv6_hdr[6], pkt_len);
       }
       break;
@@ -289,7 +288,7 @@ void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets,
 
         uint16_t ip_total_len = ((uint16_t)ip_hdr[2] << 8) | ip_hdr[3];
         uint32_t pkt_len = (uint32_t)(ip_hdr - curr_pkt) + ip_total_len;
-        aggregate_flow(d_flow_table, src_ip, dst_ip, src_port, dst_port,
+        AggregateFlow(d_flow_table, src_ip, dst_ip, src_port, dst_port,
                        protocol, pkt_len);
       }
       // IPv6
@@ -310,7 +309,7 @@ void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets,
         uint16_t ipv6_payload_len = ((uint16_t)ip_hdr[4] << 8) | ip_hdr[5];
         uint32_t pkt_len =
             (uint32_t)(ip_hdr - curr_pkt) + 40 + ipv6_payload_len;
-        aggregate_flow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
+        AggregateFlow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
                        dst_port, next_hdr, pkt_len);
       }
       break;
@@ -366,7 +365,7 @@ void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets,
 
         uint16_t ip_total_len = ((uint16_t)ip_hdr[2] << 8) | ip_hdr[3];
         uint32_t pkt_len = (uint32_t)(ip_hdr - curr_pkt) + ip_total_len;
-        aggregate_flow(d_flow_table, src_ip, dst_ip, src_port, dst_port,
+        AggregateFlow(d_flow_table, src_ip, dst_ip, src_port, dst_port,
                        ip_hdr[9], pkt_len);
 
       } else if (ip_version == 6) {
@@ -385,7 +384,7 @@ void __global__ ThreadParsing(uint8_t* d_packet_data, int* d_packet_offsets,
         uint16_t ipv6_payload_len = ((uint16_t)ipv6_hdr[4] << 8) | ipv6_hdr[5];
         uint32_t pkt_len =
             (uint32_t)(ipv6_hdr - curr_pkt) + 40 + ipv6_payload_len;
-        aggregate_flow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
+        AggregateFlow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
                        dst_port, ipv6_hdr[6], pkt_len);
       }
       break;
@@ -451,13 +450,32 @@ int main(int argc, char* argv[]) {
   cudaMemset(d_flow_table, 0, sizeof(flow_record_t) * HASH_TABLE_SIZE);
 
   // call the kernel
-  ThreadParsing<<<cuda_block_count, threads_per_block>>>(
+  PcapParallelParsing<<<cuda_block_count, threads_per_block>>>(
       d_packet_data, d_packet_offsets, total_packets, d_flow_table);
 
   cudaError_t kernel_stat = cudaDeviceSynchronize();
   if (kernel_stat != cudaSuccess) {
     printf("Kernel execution failed: %s\n", cudaGetErrorString(kernel_stat));
   }
+
+  // Allocate host-side flow table buffer
+  flow_record_t* h_flow_table = (flow_record_t*)malloc(sizeof(flow_record_t) * HASH_TABLE_SIZE);
+
+  // Copy from device back to Host
+  cudaError_t mcpy_stat = cudaMemcpy(h_flow_table, d_flow_table, sizeof(flow_record_t) * HASH_TABLE_SIZE, cudaMemcpyDeviceToHost);
+  if (mcpy_stat != cudaSuccess) {
+      printf("Failed to copy flow table back to host: %s\n", cudaGetErrorString(mcpy_stat));
+  }
+
+  // count the actual used values in the hash table
+  int active_flows = 0;
+  for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+      if (h_flow_table[i].src_ip != 0) {
+          // This is a valid, aggregated flow record
+          active_flows++;
+      }
+  }
+  printf("Total unique flows detected: %d\n", active_flows);
 
   cudaFree(d_packet_data);
   cudaFree(d_packet_offsets);
