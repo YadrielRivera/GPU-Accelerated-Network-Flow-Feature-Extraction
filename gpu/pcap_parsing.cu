@@ -1,7 +1,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include "../pcap_pre-proc/pcap_parse.c"
+#include "./pcap_batching.c"
 
 // ethernet types
 #define IPv4 0x0800

@@ -37,17 +37,37 @@ batches.
 
 ### Loading and Batching
 
-Raw PCAP files from the dataset directory are read and processed for the GPU to digest
+Raw PCAP files from the dataset directory are read and processed. They are stored in a dynamically allocated, uni-dimensional buffer that contains packet headers + payloads. Additionally, a second buffer stores the packet offsets; these indicate the GPU threads which index corresponds to the packet to work on.
+
+### GPU Parsing - Extraction, Hashing, and Grouping
+Each thread calculates it global buffer index to work on the corresponding packet. After extracting the ethernet type
+the threads determine how to extract payloads for each of the types and aggregate a 5-tuple into a flow record. The 5-tuple contains:
+- Source IP
+- Destination IP
+- Source port
+- Destination port
+- Network protocol
+
+Aggregation is executed via a variant FNV-1a hashing into a uni-dimensional flow table. The collision handling approach is Linear Probing.
+
+### Feature Reduction and Computations
 
 ## Requirements
-* A Linux-based OS
+* Linux-based OS
 * OpenMPI 
-* git lfs - to get PCAP data
-* CUDA and a CUDA-capable GPU (or use provided Google Colab file)
+* git lfs - to pull PCAP data
+* CUDA and a CUDA-capable GPU (if running locally)
+  * An alternative is to use the provided Google Colab file (details below)
+* OpenMP
+
 
 ## File Structure
 
 ## Building, Compiling & Running
+
+### Locally
+
+### Google Colab
 
 ## Dataset
 The PCAP data was obtained from WireShark [SampleCapture](https://wiki.wireshark.org/samplecaptures#sample-captures)
@@ -63,5 +83,3 @@ Accepted and processed ethernet types:
 * MLPS_MULTI 
 
 ## Useful Scripts
-
-## A Note to the Reader

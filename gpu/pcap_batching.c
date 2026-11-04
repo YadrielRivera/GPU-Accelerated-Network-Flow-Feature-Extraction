@@ -6,7 +6,7 @@
 #include <string.h>
 
 
-#define DATASET_PATH "../../../dataset"
+#define DATASET_PATH "../dataset"
 
 // PCAP global header
 typedef struct {
