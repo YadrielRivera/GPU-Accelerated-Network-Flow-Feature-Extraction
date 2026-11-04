@@ -63,9 +63,18 @@ Aggregation is executed via a variant FNV-1a hashing into a uni-dimensional flow
 
 ## File Structure
 
-## Building, Compiling & Running
+## Building, Compiling & Running (GPU)
 
 ### Locally
+From the root directory
+```bash
+cd gpu
+mkdir build 
+cd build
+nvcc -ccbin mpicxx ../src/main.cu ../src/pcap_batching.c ../src/pcap_parsing.cu -o gpu
+mpirun --allow-run-as-root --oversubscribe -np <mpi proc count> ./gpu <cuda threads>
+```
+
 
 ### Google Colab
 

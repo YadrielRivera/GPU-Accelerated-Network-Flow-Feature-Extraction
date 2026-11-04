@@ -1,5 +1,5 @@
-#include "pcap_batching.c"
-#include "pcap_parsing.cu"
+#include "../include/pcap_batching.h"
+#include "../include/pcap_parsing.h"
 
 // arguments: ./executable <CUDA_THREAD_NUMBER>
 int main(int argc, char* argv[]) {

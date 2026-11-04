@@ -1,33 +1,7 @@
-#include <dirent.h>
-#include <mpi.h>
-#include <stdint.h>
-#include <stdio.h>
+#include "../include/pcap_batching.h"
 
-#include <string.h>
+#define DATASET_PATH "../../dataset"
 
-
-#define DATASET_PATH "../dataset"
-
-// PCAP global header
-typedef struct {
-  uint32_t magic_number;   // number identifying PCAP format
-  uint16_t version_major;  // Major version number
-  uint16_t version_minor;  // Minor version number
-  int32_t thiszone;        // GMT to local correction
-  uint32_t sigfigs;        // Accuracy of timestamps
-  uint32_t snaplen;        // Max length of captured packets
-  uint32_t network;        // Data link type
-} __attribute__((packed)) pcap_hdr_t;
-
-// PCAP packet header
-typedef struct {
-  uint32_t ts_sec;    // Timestamp seconds
-  uint32_t ts_usec;   // Timestamp microseconds
-  uint32_t incl_len;  // Number of bytes of packet saved in file
-  uint32_t orig_len;  // Actual length of packet on the wire
-} __attribute__((packed)) pcap_pkt_hdr_t;
-
-// batches
 uint8_t* packet_data = NULL;
 int* packet_offsets = NULL;
 
@@ -68,13 +42,15 @@ int PcapRead(char pcap_file[]) {
     // check if we need to resize our packet_offsets array
     if (total_packets >= packet_capacity) {
       packet_capacity = (packet_capacity == 0) ? 1024 : packet_capacity * 2;
-      packet_offsets = (int*)realloc(packet_offsets, packet_capacity * sizeof(int));
+      packet_offsets =
+          (int*)realloc(packet_offsets, packet_capacity * sizeof(int));
     }
 
     // check if we need to resize our packet_data byte array
     if (total_data_bytes + data_size > data_capacity) {
       data_capacity = (data_capacity == 0) ? 65536 : data_capacity * 2;
-      packet_data = (uint8_t*)realloc(packet_data, data_capacity * sizeof(uint8_t));
+      packet_data =
+          (uint8_t*)realloc(packet_data, data_capacity * sizeof(uint8_t));
     }
     // record the starting offset for this packet
     packet_offsets[total_packets] = total_data_bytes;
@@ -92,6 +68,7 @@ int PcapRead(char pcap_file[]) {
   }
 
   fclose(fd);
+  return 0;
 }
 
 int DatasetRead(int my_rank, int num_procs) {
@@ -123,19 +100,19 @@ int DatasetRead(int my_rank, int num_procs) {
   return 0;
 }
 
-int main(int argc, char* argv[]) {
-  MPI_Init(&argc, &argv);
+// int main(int argc, char* argv[]) {
+//   MPI_Init(&argc, &argv);
 
-  int my_rank, num_procs;
-  MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
+//   int my_rank, num_procs;
+//   MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+//   MPI_Comm_size(MPI_COMM_WORLD, &num_procs);
 
-  // Each rank parses its own subset of files into its local buffers
-  DatasetRead(my_rank, num_procs);
+//   // Each rank parses its own subset of files into its local buffers
+//   DatasetRead(my_rank, num_procs);
 
-  printf("[Rank %d] Finished loading. Total packets on this rank: %zu\n",
-         my_rank, total_packets);
+//   printf("[Rank %d] Finished loading. Total packets on this rank: %zu\n",
+//          my_rank, total_packets);
 
-  MPI_Finalize();
-  return 0;
-}
+//   MPI_Finalize();
+//   return 0;
+// }
