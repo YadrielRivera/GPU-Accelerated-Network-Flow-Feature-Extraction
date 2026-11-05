@@ -107,7 +107,6 @@ After the kernel finishes, the table is copied back to the host and checked. Eve
   * The slot-claiming code makes threads in the same warp wait on each other, which relies on independent thread scheduling. Compile for the target GPU's architecture (see the build command), not for an older default.
   * An alternative is to use the provided Google Colab file (details below)
 * A host C++ compiler supported by your CUDA version (e.g. `g++`)
-* Enough memory: GPU memory for the flow table (about 88 MiB) plus each rank's packet data plus 32 bytes per packet, and the same amount of host RAM for the rank's loaded packets
 * git lfs - to pull PCAP data
 * OpenMP (CPU baseline)
 * The PCAP files placed in a `dataset` directory at the repository root. The path is hard-coded as `../../dataset`, relative to the directory the program is **run from**, so run it from `gpu/build` as shown below.
