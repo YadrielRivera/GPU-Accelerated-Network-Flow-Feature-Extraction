@@ -21,10 +21,20 @@ typedef struct {
 // PCAP packet header
 typedef struct {
   uint32_t ts_sec;    // Timestamp seconds
-  uint32_t ts_usec;   // Timestamp microseconds
+  uint32_t ts_usec;   // Timestamp microseconds (nanoseconds for 0xa1b23c4d)
   uint32_t incl_len;  // Number of bytes of packet saved in file
   uint32_t orig_len;  // Actual length of packet on the wire
 } __attribute__((packed)) pcap_pkt_hdr_t;
+
+// Per-packet metadata, one 32-byte record per packet (shared by host + GPU).
+typedef struct {
+  uint64_t offset;    // byte offset of the packet inside packet_data
+  uint64_t ts_ns;     // capture timestamp, nanoseconds
+  uint32_t caplen;    // bytes actually stored in packet_data (<= wire_len)
+  uint32_t wire_len;  // length of the frame on the wire
+  uint32_t file_id;   // index of the source pcap (keeps captures separate)
+  uint32_t _pad;
+} pkt_info_t;
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,15 +42,17 @@ extern "C" {
 
 // batches
 extern uint8_t* packet_data;
-extern int* packet_offsets;
-extern uint64_t* packet_ts;  // per-packet capture timestamp, nanoseconds
+extern pkt_info_t* packets;
 extern size_t total_data_bytes;
 extern size_t total_packets;
 extern size_t data_capacity;    // Current allocated capacity for bytes
-extern size_t packet_capacity;  // Current allocated capacity for offsets
+extern size_t packet_capacity;  // Current allocated capacity for packets
 
-int PcapRead(char pcap_file[]);
+// Returns 0 = loaded, 1 = file skipped (unsupported/unreadable), -1 = out of
+// memory (fatal).
+int PcapRead(const char* pcap_file, uint32_t file_id);
 
+// Returns 0 on success, non-zero on a fatal error.
 int DatasetRead(int my_rank, int num_procs);
 #ifdef __cplusplus
 }

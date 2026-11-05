@@ -1,30 +1,83 @@
 #include "../include/pcap_parsing.h"
 #include "../include/pcap_batching.h"
 
-// FNV-1a hashing
-__device__ uint32_t HashTuple(uint32_t src_ip, uint32_t dst_ip,
-                              uint16_t src_port, uint16_t dst_port,
-                              uint8_t proto) {
-  uint32_t hash = 2166136261UL;
-
-  hash ^= src_ip;
-  hash *= 16777619UL;
-  hash ^= dst_ip;
-  hash *= 16777619UL;
-  hash ^= ((uint32_t)src_port << 16) | dst_port;
-  hash *= 16777619UL;
-  hash ^= proto;
-  hash *= 16777619UL;
-
-  return hash;
+__device__ __forceinline__ uint16_t be16(const uint8_t* p) {
+  return ((uint16_t)p[0] << 8) | p[1];
 }
 
-__device__ void AggregateFlow(flow_record_t* table, uint32_t src_ip,
-                              uint32_t dst_ip, uint16_t src_port,
-                              uint16_t dst_port, uint8_t proto,
+__device__ __forceinline__ uint32_t be32(const uint8_t* p) {
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+         ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+__device__ __forceinline__ uint32_t Mix(uint32_t h, uint32_t x) {
+  h ^= x;
+  return h * 16777619u;  // FNV prime
+}
+
+__device__ uint32_t HashKey(const flow_key_t& k) {
+  uint32_t h = 2166136261u;  // FNV offset basis
+  h = Mix(h, k.file_id);
+#pragma unroll
+  for (int i = 0; i < 4; i++) h = Mix(h, k.src_ip[i]);
+#pragma unroll
+  for (int i = 0; i < 4; i++) h = Mix(h, k.dst_ip[i]);
+  h = Mix(h, ((uint32_t)k.src_port << 16) | k.dst_port);
+  h = Mix(h, ((uint32_t)k.proto << 8) | k.ip_ver);
+  // murmur3 finalizer: a multiply only carries information upward, so without
+  // this the bits kept by HASH_MASK ignore most of the high input bits (e.g.
+  // the upper bits of the source port).
+  h ^= h >> 16;
+  h *= 0x85ebca6bu;
+  h ^= h >> 13;
+  h *= 0xc2b2ae35u;
+  h ^= h >> 16;
+  return h;
+}
+
+__device__ __forceinline__ void StoreKey(volatile flow_key_t* d,
+                                         const flow_key_t& k) {
+  d->file_id = k.file_id;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    d->src_ip[i] = k.src_ip[i];
+    d->dst_ip[i] = k.dst_ip[i];
+  }
+  d->src_port = k.src_port;
+  d->dst_port = k.dst_port;
+  d->proto = k.proto;
+  d->ip_ver = k.ip_ver;
+}
+
+__device__ __forceinline__ void LoadKey(const volatile flow_key_t* s,
+                                        flow_key_t* k) {
+  k->file_id = s->file_id;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    k->src_ip[i] = s->src_ip[i];
+    k->dst_ip[i] = s->dst_ip[i];
+  }
+  k->src_port = s->src_port;
+  k->dst_port = s->dst_port;
+  k->proto = s->proto;
+  k->ip_ver = s->ip_ver;
+}
+
+__device__ __forceinline__ bool KeyEq(const flow_key_t& a,
+                                      const flow_key_t& b) {
+  if (a.file_id != b.file_id || a.src_port != b.src_port ||
+      a.dst_port != b.dst_port || a.proto != b.proto || a.ip_ver != b.ip_ver)
+    return false;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    if (a.src_ip[i] != b.src_ip[i] || a.dst_ip[i] != b.dst_ip[i]) return false;
+  }
+  return true;
+}
+
+__device__ bool AggregateFlow(flow_record_t* table, const flow_key_t& key,
                               uint32_t pkt_len, uint64_t ts) {
-  uint32_t idx =
-      HashTuple(src_ip, dst_ip, src_port, dst_port, proto) & HASH_MASK;
+  uint32_t idx = HashKey(key) & HASH_MASK;
 
   for (uint32_t probes = 0; probes < HASH_TABLE_SIZE; probes++) {
     flow_record_t* slot = &table[idx];
@@ -35,27 +88,23 @@ __device__ void AggregateFlow(flow_record_t* table, uint32_t src_ip,
 
     if (prev == SLOT_EMPTY) {
       // We own it: write the key, then publish
-      vslot->src_ip = src_ip;
-      vslot->dst_ip = dst_ip;
-      vslot->src_port = src_port;
-      vslot->dst_port = dst_port;
-      vslot->proto = proto;
+      StoreKey(&vslot->key, key);
       // table is zero-initialised; min/first need a "maximum" starting value
       vslot->min_pkt_len = UINT32_MAX;
       vslot->first_seen_ts = UINT64_MAX;
       __threadfence();  // key visible before READY
       atomicExch(&slot->state, SLOT_READY);
     } else {
-      // Someone else owns it wait until their key is fully published
+      // Someone else owns it: wait until their key is fully published
       while (vslot->state != SLOT_READY) {
       }
       __threadfence();
     }
 
     // Slot is READY: does the key match?
-    if (vslot->src_ip == src_ip && vslot->dst_ip == dst_ip &&
-        vslot->src_port == src_port && vslot->dst_port == dst_port &&
-        vslot->proto == proto) {
+    flow_key_t cur;
+    LoadKey(&vslot->key, &cur);
+    if (KeyEq(cur, key)) {
       atomicAdd(&slot->packet_count, 1);
       atomicAdd((unsigned long long*)&slot->byte_count,
                 (unsigned long long)pkt_len);
@@ -65,396 +114,180 @@ __device__ void AggregateFlow(flow_record_t* table, uint32_t src_ip,
                 (unsigned long long)ts);
       atomicMax((unsigned long long*)&slot->last_seen_ts,
                 (unsigned long long)ts);
-      return;
+      return true;
     }
     idx = (idx + 1) & HASH_MASK;  // genuinely different flow: probe on
   }
+  return false;  // table full
 }
 
-__device__ uint32_t fold_ipv6(const uint8_t* a) {
-  uint32_t r = 0;
-#pragma unroll
-  for (int w = 0; w < 4; w++) {
-    r ^= ((uint32_t)a[w * 4] << 24) | ((uint32_t)a[w * 4 + 1] << 16) |
-         ((uint32_t)a[w * 4 + 2] << 8) | ((uint32_t)a[w * 4 + 3]);
+__device__ bool ParseIP(const uint8_t* pkt, uint32_t caplen, const uint8_t* l3,
+                        flow_key_t* key) {
+  const uint8_t* end = pkt + caplen;
+  if (l3 >= end) return false;
+
+  uint8_t version = l3[0] >> 4;
+  const uint8_t* l4;
+  bool ports_ok = true;  // false for non-first fragments: no L4 header there
+  uint8_t proto;
+
+  if (version == 4) {
+    if (end - l3 < 20) return false;
+    uint32_t ihl = (uint32_t)(l3[0] & 0x0F) * 4;
+    if (ihl < 20 || (uint32_t)(end - l3) < ihl) return false;
+
+    key->ip_ver = 4;
+    key->src_ip[0] = be32(l3 + 12);
+    key->dst_ip[0] = be32(l3 + 16);
+    for (int i = 1; i < 4; i++) key->src_ip[i] = key->dst_ip[i] = 0;
+    proto = l3[9];
+    ports_ok = (be16(l3 + 6) & 0x1FFF) == 0;  // fragment offset
+    l4 = l3 + ihl;
+  } else if (version == 6) {
+    if (end - l3 < 40) return false;
+
+    key->ip_ver = 6;
+    for (int i = 0; i < 4; i++) {
+      key->src_ip[i] = be32(l3 + 8 + 4 * i);
+      key->dst_ip[i] = be32(l3 + 24 + 4 * i);
+    }
+
+    // Walk the extension header chain (bounded) to find the real protocol.
+    uint8_t nh = l3[6];
+    const uint8_t* cur = l3 + 40;
+    for (int n = 0; n < 8; n++) {
+      uint32_t hlen;
+      if (nh == 0 || nh == 43 || nh == 60) {  // hop-by-hop, routing, dest opts
+        if (end - cur < 8) return false;
+        hlen = ((uint32_t)cur[1] + 1) * 8;
+      } else if (nh == 51) {  // authentication header
+        if (end - cur < 8) return false;
+        hlen = ((uint32_t)cur[1] + 2) * 4;
+      } else if (nh == 44) {  // fragment header
+        if (end - cur < 8) return false;
+        if ((be16(cur + 2) >> 3) != 0) ports_ok = false;
+        hlen = 8;
+      } else {
+        break;
+      }
+      if ((uint32_t)(end - cur) < hlen) return false;
+      nh = cur[0];
+      cur += hlen;
+    }
+    proto = nh;
+    l4 = cur;
+  } else {
+    return false;
   }
-  return r;
+
+  key->proto = proto;
+  key->src_port = 0;
+  key->dst_port = 0;
+  // Only TCP/UDP/SCTP have ports. For ICMP & co. the bytes there are type /
+  // checksum, which would split one logical flow into many.
+  if (ports_ok && (proto == TCP || proto == UDP || proto == SCTP) &&
+      end - l4 >= 4) {
+    key->src_port = be16(l4);
+    key->dst_port = be16(l4 + 2);
+  }
+  return true;
 }
 
-void __global__ PcapParallelParsing(uint8_t* d_packet_data,
-                                    int* d_packet_offsets,
-                                    uint64_t* d_packet_ts, int d_total_packets,
-                                    flow_record_t* d_flow_table) {
-  int th_idx = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void PcapParallelParsing(const uint8_t* d_packet_data,
+                                    const pkt_info_t* d_packets,
+                                    size_t d_total_packets,
+                                    flow_record_t* d_flow_table,
+                                    parse_stats_t* d_stats) {
+  size_t th_idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (th_idx >= d_total_packets) return;
 
-  if (th_idx >= d_total_packets) {
+  const pkt_info_t info = d_packets[th_idx];
+  const uint8_t* pkt = d_packet_data + info.offset;
+  const uint8_t* end = pkt + info.caplen;
+
+  if (info.caplen < 14) {
+    atomicAdd(&d_stats->malformed, 1ULL);
     return;
   }
 
-  int offset = d_packet_offsets[th_idx];
-  uint64_t ts = d_packet_ts[th_idx];
-  uint8_t* curr_pkt = d_packet_data + offset;
+  uint16_t ethertype = be16(pkt + 12);
+  const uint8_t* cur = pkt + 14;
+  bool malformed = false;
 
-  uint16_t ethertype = (curr_pkt[12] << 8) | curr_pkt[13];
-
-  switch (ethertype) {
-    case IPv4: {
-      const uint8_t* ip_header = curr_pkt + 14;
-      uint8_t protocol = ip_header[9];
-
-      uint32_t src_ip =
-          ((uint32_t)ip_header[12] << 24) | ((uint32_t)ip_header[13] << 16) |
-          ((uint32_t)ip_header[14] << 8) | ((uint32_t)ip_header[15]);
-      uint32_t dst_ip =
-          ((uint32_t)ip_header[16] << 24) | ((uint32_t)ip_header[17] << 16) |
-          ((uint32_t)ip_header[18] << 8) | ((uint32_t)ip_header[19]);
-
-      uint8_t hdr_len = (ip_header[0] & 0x0F) * 4;
-      const uint8_t* trnsprt_hdr = ip_header + hdr_len;
-
-      uint16_t src_port = ((uint16_t)trnsprt_hdr[0] << 8) | trnsprt_hdr[1];
-      uint16_t dst_port = ((uint16_t)trnsprt_hdr[2] << 8) | trnsprt_hdr[3];
-
-      uint16_t ip_total_len = ((uint16_t)ip_header[2] << 8) | ip_header[3];
-      uint32_t pkt_len = (uint32_t)(ip_header - curr_pkt) + ip_total_len;
-      AggregateFlow(d_flow_table, src_ip, dst_ip, src_port, dst_port, protocol,
-                    pkt_len, ts);
-
+  // VLAN tags (802.1Q / 802.1ad), possibly stacked
+  for (int d = 0; d < 8 && (ethertype == VLAN_TAG || ethertype == QINQ_TAG);
+       d++) {
+    if (end - cur < 4) {
+      malformed = true;
       break;
     }
-    case ARP: {
-      uint8_t* arp_hdr = curr_pkt + 14;
+    ethertype = be16(cur + 2);
+    cur += 4;
+  }
 
-      uint16_t hw_type = ((uint16_t)arp_hdr[0] << 8) | arp_hdr[1];
-      uint16_t proto_type = ((uint16_t)arp_hdr[2] << 8) | arp_hdr[3];
-      uint16_t operation =
-          ((uint16_t)arp_hdr[6] << 8) | arp_hdr[7];  // 1 = Request, 2 = Reply
-
-      if (hw_type == 1 && proto_type == IPv4) {
-        uint32_t sender_ip =
-            ((uint32_t)arp_hdr[14] << 24) | ((uint32_t)arp_hdr[15] << 16) |
-            ((uint32_t)arp_hdr[16] << 8) | (uint32_t)arp_hdr[17];
-
-        uint32_t target_ip =
-            ((uint32_t)arp_hdr[24] << 24) | ((uint32_t)arp_hdr[25] << 16) |
-            ((uint32_t)arp_hdr[26] << 8) | (uint32_t)arp_hdr[27];
-      }
-      break;
-    }
-    case IPv6: {
-      const uint8_t* ipv6_hdr = curr_pkt + 14;
-
-      uint8_t next_hdr = ipv6_hdr[6];
-
-      const uint8_t* src_ipv6 = ipv6_hdr + 8;
-
-      const uint8_t* dst_ipv6 = ipv6_hdr + 24;
-
-      const uint8_t* trnsprt_hdr = ipv6_hdr + 40;
-
-      uint16_t src_port = ((uint16_t)trnsprt_hdr[0] << 8) | trnsprt_hdr[1];
-      uint16_t dst_port = ((uint16_t)trnsprt_hdr[2] << 8) | trnsprt_hdr[3];
-
-      uint32_t src_ip_folded = fold_ipv6(src_ipv6);
-      uint32_t dst_ip_folded = fold_ipv6(dst_ipv6);
-      uint16_t ipv6_payload_len = ((uint16_t)ipv6_hdr[4] << 8) | ipv6_hdr[5];
-      uint32_t pkt_len =
-          (uint32_t)(ipv6_hdr - curr_pkt) + 40 + ipv6_payload_len;
-      AggregateFlow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
-                    dst_port, next_hdr, pkt_len, ts);
-      break;
-    }
-    case VLAN_TAG: {
-      const uint8_t* cursor = curr_pkt + 14;
-      uint16_t current_ethertype = ethertype;
-      bool parsing_payload = false;
-
-      while (!parsing_payload) {
-        switch (current_ethertype) {
-          case VLAN_TAG: {
-            uint16_t tci = ((uint16_t)cursor[0] << 8) | cursor[1];
-            uint16_t vlan_id = tci & 0x0FFF;
-
-            current_ethertype = ((uint16_t)cursor[2] << 8) | cursor[3];
-            cursor += 4;  // Advance past VLAN tag
+  const uint8_t* l3 = NULL;
+  if (!malformed) {
+    switch (ethertype) {
+      case IPv4:
+      case IPv6:
+        l3 = cur;
+        break;
+      case MLPS_UNI:
+      case MLPS_MULTI: {
+        // pop labels until the bottom-of-stack bit (bounded)
+        bool bos = false;
+        for (int d = 0; d < 16 && !bos; d++) {
+          if (end - cur < 4) {
+            malformed = true;
             break;
           }
-          case IPv4:
-          case IPv6:
-          case ARP:
-            parsing_payload = true;
-            break;
-          default:
-            parsing_payload = true;
-            current_ethertype = 0;  // Unsupported inner protocol
-            break;
+          bos = (cur[2] & 0x01) != 0;
+          cur += 4;
         }
-      }
-      if (current_ethertype == IPv4) {
-        const uint8_t* ip_hdr = cursor;
-        uint8_t hdr_len = (ip_hdr[0] & 0x0F) * 4;
-        const uint8_t* trnsprt_hdr = ip_hdr + hdr_len;
-
-        uint32_t src_ip = ((uint32_t)ip_hdr[12] << 24) |
-                          ((uint32_t)ip_hdr[13] << 16) |
-                          ((uint32_t)ip_hdr[14] << 8) | (uint32_t)ip_hdr[15];
-        uint32_t dst_ip = ((uint32_t)ip_hdr[16] << 24) |
-                          ((uint32_t)ip_hdr[17] << 16) |
-                          ((uint32_t)ip_hdr[18] << 8) | (uint32_t)ip_hdr[19];
-
-        uint16_t src_port = ((uint16_t)trnsprt_hdr[0] << 8) | trnsprt_hdr[1];
-        uint16_t dst_port = ((uint16_t)trnsprt_hdr[2] << 8) | trnsprt_hdr[3];
-
-        uint16_t ip_total_len = ((uint16_t)ip_hdr[2] << 8) | ip_hdr[3];
-        uint32_t pkt_len = (uint32_t)(ip_hdr - curr_pkt) + ip_total_len;
-        AggregateFlow(d_flow_table, src_ip, dst_ip, src_port, dst_port,
-                      ip_hdr[9], pkt_len, ts);
-
-      } else if (current_ethertype == IPv6) {
-        const uint8_t* ipv6_hdr = cursor;
-        const uint8_t* trnsprt_hdr = ipv6_hdr + 40;
-
-        uint16_t src_port = ((uint16_t)trnsprt_hdr[0] << 8) | trnsprt_hdr[1];
-        uint16_t dst_port = ((uint16_t)trnsprt_hdr[2] << 8) | trnsprt_hdr[3];
-
-        const uint8_t* src_ipv6 = ipv6_hdr + 8;
-
-        const uint8_t* dst_ipv6 = ipv6_hdr + 24;
-
-        uint32_t src_ip_folded = fold_ipv6(src_ipv6);
-        uint32_t dst_ip_folded = fold_ipv6(dst_ipv6);
-        uint16_t ipv6_payload_len = ((uint16_t)ipv6_hdr[4] << 8) | ipv6_hdr[5];
-        uint32_t pkt_len =
-            (uint32_t)(ipv6_hdr - curr_pkt) + 40 + ipv6_payload_len;
-        AggregateFlow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
-                      dst_port, ipv6_hdr[6], pkt_len, ts);
-      }
-      break;
-    }
-    case PPPoE_SESSION: {
-      uint8_t* ses_hdr = curr_pkt + 14;
-
-      uint8_t ver_type = ses_hdr[0];
-      uint8_t code = ses_hdr[1];
-      uint16_t ses_id = ((uint16_t)ses_hdr[2] << 8) | ses_hdr[3];
-      uint16_t len = ((uint16_t)ses_hdr[4] << 8) | ses_hdr[5];
-      uint16_t pproc = ((uint16_t)ses_hdr[6] << 8) | ses_hdr[7];
-
-      const uint8_t* ip_hdr = ses_hdr + 8;
-      // IPv4
-      if (pproc == 0x0021) {
-        uint8_t protocol = ip_hdr[9];
-
-        uint32_t src_ip = ((uint32_t)ip_hdr[12] << 24) |
-                          ((uint32_t)ip_hdr[13] << 16) |
-                          ((uint32_t)ip_hdr[14] << 8) | ((uint32_t)ip_hdr[15]);
-        uint32_t dst_ip = ((uint32_t)ip_hdr[16] << 24) |
-                          ((uint32_t)ip_hdr[17] << 16) |
-                          ((uint32_t)ip_hdr[18] << 8) | ((uint32_t)ip_hdr[19]);
-
-        uint8_t hdr_len = (ip_hdr[0] & 0x0F) * 4;
-        const uint8_t* trnsprt_hdr = ip_hdr + hdr_len;
-
-        uint16_t src_port = ((uint16_t)trnsprt_hdr[0] << 8) | trnsprt_hdr[1];
-        uint16_t dst_port = ((uint16_t)trnsprt_hdr[2] << 8) | trnsprt_hdr[3];
-
-        uint16_t ip_total_len = ((uint16_t)ip_hdr[2] << 8) | ip_hdr[3];
-        uint32_t pkt_len = (uint32_t)(ip_hdr - curr_pkt) + ip_total_len;
-        AggregateFlow(d_flow_table, src_ip, dst_ip, src_port, dst_port,
-                      protocol, pkt_len, ts);
-      }
-      // IPv6
-      if (pproc == 0x0057) {
-        uint8_t next_hdr = ip_hdr[6];
-
-        const uint8_t* src_ipv6 = ip_hdr + 8;
-
-        const uint8_t* dst_ipv6 = ip_hdr + 24;
-
-        const uint8_t* trnsprt_hdr = ip_hdr + 40;
-
-        uint16_t src_port = ((uint16_t)trnsprt_hdr[0] << 8) | trnsprt_hdr[1];
-        uint16_t dst_port = ((uint16_t)trnsprt_hdr[2] << 8) | trnsprt_hdr[3];
-
-        uint32_t src_ip_folded = fold_ipv6(src_ipv6);
-        uint32_t dst_ip_folded = fold_ipv6(dst_ipv6);
-        uint16_t ipv6_payload_len = ((uint16_t)ip_hdr[4] << 8) | ip_hdr[5];
-        uint32_t pkt_len =
-            (uint32_t)(ip_hdr - curr_pkt) + 40 + ipv6_payload_len;
-        AggregateFlow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
-                      dst_port, next_hdr, pkt_len, ts);
-      }
-      break;
-    }
-    case PPPoE_DISCOV: {
-      // parse, but we don't use it because
-      // it wont produce 5-tuples
-      // this section is just to avoid crashing
-      const uint8_t* disc_hdr = curr_pkt + 14;
-
-      uint8_t ver_type = disc_hdr[0];
-      uint8_t code = disc_hdr[1];
-      uint16_t ses_id = ((uint16_t)disc_hdr[2] << 8) |
-                        disc_hdr[3];  // Usually 0x0000 during discovery
-      uint16_t pyld_len = ((uint16_t)disc_hdr[4] << 8) | disc_hdr[5];
-
-      break;
-    }
-    case MLPS_UNI:
-    case MLPS_MULTI: {
-      const uint8_t* cursor = curr_pkt + 14;
-      bool bottom_of_stack = false;
-
-      // Iteratively strip MPLS label stack
-      while (!bottom_of_stack) {
-        uint32_t mpls_entry = ((uint32_t)cursor[0] << 24) |
-                              ((uint32_t)cursor[1] << 16) |
-                              ((uint32_t)cursor[2] << 8) | (uint32_t)cursor[3];
-
-        if (cursor[2] & 0x01) {
-          bottom_of_stack = true;
+        if (!malformed) {
+          if (!bos) {
+            malformed = true;
+          } else if (end - cur >= 1 &&
+                     ((cur[0] >> 4) == 4 || (cur[0] >> 4) == 6)) {
+            l3 = cur;
+          }
         }
-
-        cursor += 4;
+        break;
       }
-
-      uint8_t ip_version = cursor[0] >> 4;
-
-      if (ip_version == 4) {
-        const uint8_t* ip_hdr = cursor;
-        uint8_t hdr_len = (ip_hdr[0] & 0x0F) * 4;
-        const uint8_t* trnsprt_hdr = ip_hdr + hdr_len;
-
-        uint32_t src_ip = ((uint32_t)ip_hdr[12] << 24) |
-                          ((uint32_t)ip_hdr[13] << 16) |
-                          ((uint32_t)ip_hdr[14] << 8) | (uint32_t)ip_hdr[15];
-        uint32_t dst_ip = ((uint32_t)ip_hdr[16] << 24) |
-                          ((uint32_t)ip_hdr[17] << 16) |
-                          ((uint32_t)ip_hdr[18] << 8) | (uint32_t)ip_hdr[19];
-
-        uint16_t src_port = ((uint16_t)trnsprt_hdr[0] << 8) | trnsprt_hdr[1];
-        uint16_t dst_port = ((uint16_t)trnsprt_hdr[2] << 8) | trnsprt_hdr[3];
-
-        uint16_t ip_total_len = ((uint16_t)ip_hdr[2] << 8) | ip_hdr[3];
-        uint32_t pkt_len = (uint32_t)(ip_hdr - curr_pkt) + ip_total_len;
-        AggregateFlow(d_flow_table, src_ip, dst_ip, src_port, dst_port,
-                      ip_hdr[9], pkt_len, ts);
-
-      } else if (ip_version == 6) {
-        const uint8_t* ipv6_hdr = cursor;
-        const uint8_t* trnsprt_hdr = ipv6_hdr + 40;
-
-        uint16_t src_port = ((uint16_t)trnsprt_hdr[0] << 8) | trnsprt_hdr[1];
-        uint16_t dst_port = ((uint16_t)trnsprt_hdr[2] << 8) | trnsprt_hdr[3];
-
-        const uint8_t* src_ipv6 = ipv6_hdr + 8;
-
-        const uint8_t* dst_ipv6 = ipv6_hdr + 24;
-
-        uint32_t src_ip_folded = fold_ipv6(src_ipv6);
-        uint32_t dst_ip_folded = fold_ipv6(dst_ipv6);
-        uint16_t ipv6_payload_len = ((uint16_t)ipv6_hdr[4] << 8) | ipv6_hdr[5];
-        uint32_t pkt_len =
-            (uint32_t)(ipv6_hdr - curr_pkt) + 40 + ipv6_payload_len;
-        AggregateFlow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
-                      dst_port, ipv6_hdr[6], pkt_len, ts);
+      case PPPoE_SESSION: {
+        // 6-byte PPPoE header + 2-byte PPP protocol: 0x0021 = IPv4, 0x0057 = IPv6
+        if (end - cur < 8) {
+          malformed = true;
+          break;
+        }
+        uint16_t ppp = be16(cur + 6);
+        if (ppp == 0x0021 || ppp == 0x0057) l3 = cur + 8;
+        break;
       }
-      break;
+      default:  // ARP, PPPoE discovery, anything else: no flow
+        break;
     }
-    default:
-      break;
+  }
+
+  if (malformed) {
+    atomicAdd(&d_stats->malformed, 1ULL);
+    return;
+  }
+  if (l3 == NULL) {
+    atomicAdd(&d_stats->non_flow, 1ULL);
+    return;
+  }
+
+  flow_key_t key;
+  key.file_id = info.file_id;
+  if (!ParseIP(pkt, info.caplen, l3, &key)) {
+    atomicAdd(&d_stats->malformed, 1ULL);
+    return;
+  }
+
+  // Length = frame length on the wire (pcap orig_len), independent of the IP
+  // header, so TSO/GSO captures (IP total length 0) and padding are handled.
+  if (!AggregateFlow(d_flow_table, key, info.wire_len, info.ts_ns)) {
+    atomicAdd(&d_stats->table_full, 1ULL);
   }
 }
-
-// int main(int argc, char* argv[]) {
-//   int threads_per_block = 1024;
-//   int cuda_block_count =
-//       (total_packets + threads_per_block - 1) / threads_per_block;
-
-//   if (argc >= 2) {
-//     threads_per_block = atoi(argv[1]);
-//     cuda_block_count =
-//         (total_packets + threads_per_block - 1) / threads_per_block;
-//   }
-
-//   uint8_t* d_packet_data;
-//   int* d_packet_offsets;
-
-//   cudaError_t pd_stat =
-//       cudaMalloc(&d_packet_data, sizeof(uint8_t) * data_capacity);
-//   if (pd_stat != cudaSuccess) {
-//     printf("Cuda failed to allocate memory: %s\n", cudaGetErrorString(pd_stat));
-//     return 1;
-//   }
-
-//   cudaError_t po_stat =
-//       cudaMalloc(&d_packet_offsets, sizeof(int) * total_packets);
-//   if (po_stat != cudaSuccess) {
-//     printf("Cuda failed to allocate memory: %s\n", cudaGetErrorString(po_stat));
-//     return 1;
-//   }
-
-//   pd_stat = cudaMemcpy(d_packet_data, packet_data, total_data_bytes,
-//                        cudaMemcpyHostToDevice);
-//   po_stat = cudaMemcpy(d_packet_offsets, packet_offsets,
-//                        total_packets * sizeof(int), cudaMemcpyHostToDevice);
-
-//   if (pd_stat != cudaSuccess) {
-//     printf("Cuda failed to copy memory to the GPU: %s\n",
-//            cudaGetErrorString(pd_stat));
-//     return 1;
-//   }
-
-//   if (po_stat != cudaSuccess) {
-//     printf("Cuda failed to copy memory to the GPU: %s\n",
-//            cudaGetErrorString(po_stat));
-//     return 1;
-//   }
-
-//   flow_record_t* d_flow_table;
-//   cudaError_t ft_stat =
-//       cudaMalloc(&d_flow_table, sizeof(flow_record_t) * HASH_TABLE_SIZE);
-//   if (ft_stat != cudaSuccess) {
-//     printf("Cuda failed to allocate hash table: %s\n",
-//            cudaGetErrorString(ft_stat));
-//     return 1;
-//   }
-//   cudaMemset(d_flow_table, 0, sizeof(flow_record_t) * HASH_TABLE_SIZE);
-
-//   // call the kernel
-//   PcapParallelParsing<<<cuda_block_count, threads_per_block>>>(
-//       d_packet_data, d_packet_offsets, total_packets, d_flow_table);
-
-//   cudaError_t kernel_stat = cudaDeviceSynchronize();
-//   if (kernel_stat != cudaSuccess) {
-//     printf("Kernel execution failed: %s\n", cudaGetErrorString(kernel_stat));
-//   }
-
-//   // Allocate host-side flow table buffer
-//   flow_record_t* h_flow_table =
-//       (flow_record_t*)malloc(sizeof(flow_record_t) * HASH_TABLE_SIZE);
-
-//   // Copy from device back to Host
-//   cudaError_t mcpy_stat = cudaMemcpy(h_flow_table, d_flow_table,
-//                                      sizeof(flow_record_t) * HASH_TABLE_SIZE,
-//                                      cudaMemcpyDeviceToHost);
-//   if (mcpy_stat != cudaSuccess) {
-//     printf("Failed to copy flow table back to host: %s\n",
-//            cudaGetErrorString(mcpy_stat));
-//   }
-
-//   // count the actual used values in the hash table
-//   int active_flows = 0;
-//   for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-//     if (h_flow_table[i].src_ip != 0) {
-//       // This is a valid, aggregated flow record
-//       active_flows++;
-//     }
-//   }
-//   printf("Total unique flows detected: %d\n", active_flows);
-
-//   cudaFree(d_packet_data);
-//   cudaFree(d_packet_offsets);
-//   cudaFree(d_flow_table);
-//   return 0;
-// }
