@@ -22,7 +22,7 @@ __device__ uint32_t HashTuple(uint32_t src_ip, uint32_t dst_ip,
 __device__ void AggregateFlow(flow_record_t* table, uint32_t src_ip,
                               uint32_t dst_ip, uint16_t src_port,
                               uint16_t dst_port, uint8_t proto,
-                              uint32_t pkt_len) {
+                              uint32_t pkt_len, uint64_t ts) {
   uint32_t idx =
       HashTuple(src_ip, dst_ip, src_port, dst_port, proto) & HASH_MASK;
 
@@ -40,6 +40,9 @@ __device__ void AggregateFlow(flow_record_t* table, uint32_t src_ip,
       vslot->src_port = src_port;
       vslot->dst_port = dst_port;
       vslot->proto = proto;
+      // table is zero-initialised; min/first need a "maximum" starting value
+      vslot->min_pkt_len = UINT32_MAX;
+      vslot->first_seen_ts = UINT64_MAX;
       __threadfence();  // key visible before READY
       atomicExch(&slot->state, SLOT_READY);
     } else {
@@ -56,6 +59,12 @@ __device__ void AggregateFlow(flow_record_t* table, uint32_t src_ip,
       atomicAdd(&slot->packet_count, 1);
       atomicAdd((unsigned long long*)&slot->byte_count,
                 (unsigned long long)pkt_len);
+      atomicMin(&slot->min_pkt_len, pkt_len);
+      atomicMax(&slot->max_pkt_len, pkt_len);
+      atomicMin((unsigned long long*)&slot->first_seen_ts,
+                (unsigned long long)ts);
+      atomicMax((unsigned long long*)&slot->last_seen_ts,
+                (unsigned long long)ts);
       return;
     }
     idx = (idx + 1) & HASH_MASK;  // genuinely different flow: probe on
@@ -73,7 +82,8 @@ __device__ uint32_t fold_ipv6(const uint8_t* a) {
 }
 
 void __global__ PcapParallelParsing(uint8_t* d_packet_data,
-                                    int* d_packet_offsets, int d_total_packets,
+                                    int* d_packet_offsets,
+                                    uint64_t* d_packet_ts, int d_total_packets,
                                     flow_record_t* d_flow_table) {
   int th_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -82,6 +92,7 @@ void __global__ PcapParallelParsing(uint8_t* d_packet_data,
   }
 
   int offset = d_packet_offsets[th_idx];
+  uint64_t ts = d_packet_ts[th_idx];
   uint8_t* curr_pkt = d_packet_data + offset;
 
   uint16_t ethertype = (curr_pkt[12] << 8) | curr_pkt[13];
@@ -107,7 +118,7 @@ void __global__ PcapParallelParsing(uint8_t* d_packet_data,
       uint16_t ip_total_len = ((uint16_t)ip_header[2] << 8) | ip_header[3];
       uint32_t pkt_len = (uint32_t)(ip_header - curr_pkt) + ip_total_len;
       AggregateFlow(d_flow_table, src_ip, dst_ip, src_port, dst_port, protocol,
-                    pkt_len);
+                    pkt_len, ts);
 
       break;
     }
@@ -150,7 +161,7 @@ void __global__ PcapParallelParsing(uint8_t* d_packet_data,
       uint32_t pkt_len =
           (uint32_t)(ipv6_hdr - curr_pkt) + 40 + ipv6_payload_len;
       AggregateFlow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
-                    dst_port, next_hdr, pkt_len);
+                    dst_port, next_hdr, pkt_len, ts);
       break;
     }
     case VLAN_TAG: {
@@ -197,7 +208,7 @@ void __global__ PcapParallelParsing(uint8_t* d_packet_data,
         uint16_t ip_total_len = ((uint16_t)ip_hdr[2] << 8) | ip_hdr[3];
         uint32_t pkt_len = (uint32_t)(ip_hdr - curr_pkt) + ip_total_len;
         AggregateFlow(d_flow_table, src_ip, dst_ip, src_port, dst_port,
-                      ip_hdr[9], pkt_len);
+                      ip_hdr[9], pkt_len, ts);
 
       } else if (current_ethertype == IPv6) {
         const uint8_t* ipv6_hdr = cursor;
@@ -216,7 +227,7 @@ void __global__ PcapParallelParsing(uint8_t* d_packet_data,
         uint32_t pkt_len =
             (uint32_t)(ipv6_hdr - curr_pkt) + 40 + ipv6_payload_len;
         AggregateFlow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
-                      dst_port, ipv6_hdr[6], pkt_len);
+                      dst_port, ipv6_hdr[6], pkt_len, ts);
       }
       break;
     }
@@ -250,7 +261,7 @@ void __global__ PcapParallelParsing(uint8_t* d_packet_data,
         uint16_t ip_total_len = ((uint16_t)ip_hdr[2] << 8) | ip_hdr[3];
         uint32_t pkt_len = (uint32_t)(ip_hdr - curr_pkt) + ip_total_len;
         AggregateFlow(d_flow_table, src_ip, dst_ip, src_port, dst_port,
-                      protocol, pkt_len);
+                      protocol, pkt_len, ts);
       }
       // IPv6
       if (pproc == 0x0057) {
@@ -271,7 +282,7 @@ void __global__ PcapParallelParsing(uint8_t* d_packet_data,
         uint32_t pkt_len =
             (uint32_t)(ip_hdr - curr_pkt) + 40 + ipv6_payload_len;
         AggregateFlow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
-                      dst_port, next_hdr, pkt_len);
+                      dst_port, next_hdr, pkt_len, ts);
       }
       break;
     }
@@ -327,7 +338,7 @@ void __global__ PcapParallelParsing(uint8_t* d_packet_data,
         uint16_t ip_total_len = ((uint16_t)ip_hdr[2] << 8) | ip_hdr[3];
         uint32_t pkt_len = (uint32_t)(ip_hdr - curr_pkt) + ip_total_len;
         AggregateFlow(d_flow_table, src_ip, dst_ip, src_port, dst_port,
-                      ip_hdr[9], pkt_len);
+                      ip_hdr[9], pkt_len, ts);
 
       } else if (ip_version == 6) {
         const uint8_t* ipv6_hdr = cursor;
@@ -346,7 +357,7 @@ void __global__ PcapParallelParsing(uint8_t* d_packet_data,
         uint32_t pkt_len =
             (uint32_t)(ipv6_hdr - curr_pkt) + 40 + ipv6_payload_len;
         AggregateFlow(d_flow_table, src_ip_folded, dst_ip_folded, src_port,
-                      dst_port, ipv6_hdr[6], pkt_len);
+                      dst_port, ipv6_hdr[6], pkt_len, ts);
       }
       break;
     }

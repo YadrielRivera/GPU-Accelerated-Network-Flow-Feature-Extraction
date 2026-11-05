@@ -33,6 +33,7 @@ extern "C" {
 // batches
 extern uint8_t* packet_data;
 extern int* packet_offsets;
+extern uint64_t* packet_ts;  // per-packet capture timestamp, nanoseconds
 extern size_t total_data_bytes;
 extern size_t total_packets;
 extern size_t data_capacity;    // Current allocated capacity for bytes

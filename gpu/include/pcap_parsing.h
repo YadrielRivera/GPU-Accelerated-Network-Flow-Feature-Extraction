@@ -32,13 +32,19 @@
 
 typedef struct __align__(8) {
   uint32_t state;
+  // 5-tuple (written once by the slot owner)
   uint32_t src_ip;
   uint32_t dst_ip;
   uint16_t src_port;
   uint16_t dst_port;
   uint8_t proto;
+  // aggregates (atomics)
   uint32_t packet_count;
+  uint32_t min_pkt_len;
+  uint32_t max_pkt_len;
   uint64_t byte_count;
+  uint64_t first_seen_ts;  // ns
+  uint64_t last_seen_ts;   // ns
 }
 flow_record_t;
 
@@ -49,12 +55,13 @@ __device__ uint32_t HashTuple(uint32_t src_ip, uint32_t dst_ip,
 __device__ void AggregateFlow(flow_record_t* table, uint32_t src_ip,
                               uint32_t dst_ip, uint16_t src_port,
                               uint16_t dst_port, uint8_t proto,
-                              uint32_t pkt_len);
+                              uint32_t pkt_len, uint64_t ts);
 
 __device__ uint32_t fold_ipv6(const uint8_t* a);
 
 void __global__ PcapParallelParsing(uint8_t* d_packet_data,
-                                    int* d_packet_offsets, int d_total_packets,
+                                    int* d_packet_offsets,
+                                    uint64_t* d_packet_ts, int d_total_packets,
                                     flow_record_t* d_flow_table);
 
 #endif

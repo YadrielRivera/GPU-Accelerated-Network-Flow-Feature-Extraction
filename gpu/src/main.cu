@@ -27,6 +27,7 @@ int main(int argc, char* argv[]) {
 
   uint8_t* d_packet_data;
   int* d_packet_offsets;
+  uint64_t* d_packet_ts;
 
   cudaError_t pd_stat =
       cudaMalloc(&d_packet_data, sizeof(uint8_t) * data_capacity);
@@ -42,10 +43,19 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+  cudaError_t ts_stat =
+      cudaMalloc(&d_packet_ts, sizeof(uint64_t) * total_packets);
+  if (ts_stat != cudaSuccess) {
+    printf("Cuda failed to allocate memory: %s\n", cudaGetErrorString(ts_stat));
+    return 1;
+  }
+
   pd_stat = cudaMemcpy(d_packet_data, packet_data, total_data_bytes,
                        cudaMemcpyHostToDevice);
   po_stat = cudaMemcpy(d_packet_offsets, packet_offsets,
                        total_packets * sizeof(int), cudaMemcpyHostToDevice);
+  ts_stat = cudaMemcpy(d_packet_ts, packet_ts, total_packets * sizeof(uint64_t),
+                       cudaMemcpyHostToDevice);
 
   if (pd_stat != cudaSuccess) {
     printf("Cuda failed to copy memory to the GPU: %s\n",
@@ -56,6 +66,12 @@ int main(int argc, char* argv[]) {
   if (po_stat != cudaSuccess) {
     printf("Cuda failed to copy memory to the GPU: %s\n",
            cudaGetErrorString(po_stat));
+    return 1;
+  }
+
+  if (ts_stat != cudaSuccess) {
+    printf("Cuda failed to copy memory to the GPU: %s\n",
+           cudaGetErrorString(ts_stat));
     return 1;
   }
 
@@ -71,7 +87,8 @@ int main(int argc, char* argv[]) {
 
   // call the kernel
   PcapParallelParsing<<<cuda_block_count, threads_per_block>>>(
-      d_packet_data, d_packet_offsets, total_packets, d_flow_table);
+      d_packet_data, d_packet_offsets, d_packet_ts, total_packets,
+      d_flow_table);
 
   cudaError_t kernel_stat = cudaDeviceSynchronize();
   if (kernel_stat != cudaSuccess) {
@@ -90,8 +107,18 @@ int main(int argc, char* argv[]) {
   // count the actual used values in the hash table
   int active_flows = 0;
   for (int i = 0; i < HASH_TABLE_SIZE; i++) {
-      if (h_flow_table[i].src_ip != 0) {
+      if (h_flow_table[i].state == SLOT_READY) {
           // This is a valid, aggregated flow record
+          if (active_flows < 5) {
+              const flow_record_t* f = &h_flow_table[i];
+              printf("flow %u:%u -> %u:%u proto=%u pkts=%u bytes=%llu"
+                     " len[min=%u max=%u] first=%llu last=%llu\n",
+                     f->src_ip, f->src_port, f->dst_ip, f->dst_port, f->proto,
+                     f->packet_count, (unsigned long long)f->byte_count,
+                     f->min_pkt_len, f->max_pkt_len,
+                     (unsigned long long)f->first_seen_ts,
+                     (unsigned long long)f->last_seen_ts);
+          }
           active_flows++;
       }
   }
@@ -99,6 +126,7 @@ int main(int argc, char* argv[]) {
 
   cudaFree(d_packet_data);
   cudaFree(d_packet_offsets);
+  cudaFree(d_packet_ts);
   cudaFree(d_flow_table);
   MPI_Finalize();
   return 0;

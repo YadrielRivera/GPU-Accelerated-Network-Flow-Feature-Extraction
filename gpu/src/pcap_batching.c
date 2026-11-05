@@ -4,6 +4,7 @@
 
 uint8_t* packet_data = NULL;
 int* packet_offsets = NULL;
+uint64_t* packet_ts = NULL;  // capture timestamp per packet, in nanoseconds
 
 size_t total_data_bytes = 0;
 size_t total_packets = 0;
@@ -34,6 +35,9 @@ int PcapRead(char pcap_file[]) {
     return 1;
   }
 
+  // 0xa1b23c4d pcaps store nanoseconds in ts_usec, 0xa1b2c3d4 store microseconds
+  int nano = (glob_hdr.magic_number == 0xa1b23c4d);
+
   // check each packet header and write the data
   pcap_pkt_hdr_t pkt_hdr;
   while (fread(&pkt_hdr, sizeof(pkt_hdr), 1, fd) == 1) {
@@ -44,6 +48,8 @@ int PcapRead(char pcap_file[]) {
       packet_capacity = (packet_capacity == 0) ? 1024 : packet_capacity * 2;
       packet_offsets =
           (int*)realloc(packet_offsets, packet_capacity * sizeof(int));
+      packet_ts =
+          (uint64_t*)realloc(packet_ts, packet_capacity * sizeof(uint64_t));
     }
 
     // check if we need to resize our packet_data byte array
@@ -54,6 +60,10 @@ int PcapRead(char pcap_file[]) {
     }
     // record the starting offset for this packet
     packet_offsets[total_packets] = total_data_bytes;
+    // store the timestamp normalized to nanoseconds
+    packet_ts[total_packets] = (uint64_t)pkt_hdr.ts_sec * 1000000000ULL +
+                               (nano ? (uint64_t)pkt_hdr.ts_usec
+                                     : (uint64_t)pkt_hdr.ts_usec * 1000ULL);
 
     // read the entire packet payload directly into our flat buffer
     size_t bytes_read = fread(packet_data + total_data_bytes, 1, data_size, fd);
