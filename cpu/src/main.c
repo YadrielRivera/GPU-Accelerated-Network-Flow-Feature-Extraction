@@ -11,6 +11,7 @@ int main(int argc, char* argv[]) {
   omp_set_num_threads(thread_count);
 
   // call the batching method/s
+  DatasetRead();
 
   // call the processing methods
 

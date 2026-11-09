@@ -53,7 +53,7 @@ extern size_t packet_capacity;  // Current allocated capacity for packets
 int PcapRead(const char* pcap_file, uint32_t file_id);
 
 // Returns 0 on success, non-zero on a fatal error.
-int DatasetRead(int num_threads);
+int DatasetRead();
 #ifdef __cplusplus
 }
 #endif
