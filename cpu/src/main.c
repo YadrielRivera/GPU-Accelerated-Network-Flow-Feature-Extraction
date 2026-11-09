@@ -1,3 +1,5 @@
+#include <time.h>
+
 #include "pcap_batching.h"
 #include "pcap_processing.h"
 
@@ -30,7 +32,10 @@ int main(int argc, char* argv[]) {
   omp_set_num_threads(thread_count);
   printf("[CPU-OMP] Running with %d OpenMP threads\n", thread_count);
 
-  // 1. Read dataset files sequentially into flat host arrays
+  struct timespec chron_s, chron_e;
+  clock_gettime(CLOCK_MONOTONIC, &chron_s);
+
+  // Read dataset files sequentially into flat host arrays
   if (DatasetRead() != 0) {
     fprintf(stderr, "Error reading dataset directory or pcap files.\n");
     return 1;
@@ -42,7 +47,7 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  // 2. Allocate the global host-side flow table and stats structure
+  // Allocate the global host-side flow table and stats structure
   const size_t table_bytes = sizeof(flow_record_t) * (size_t)HASH_TABLE_SIZE;
   flow_record_t* global_flow_table = (flow_record_t*)calloc(1, table_bytes);
   if (global_flow_table == NULL) {
@@ -54,13 +59,11 @@ int main(int argc, char* argv[]) {
 
   parse_stats_t stats = {0, 0, 0};
 
-  // 3. Execute the OpenMP parallel packet parsing and flow aggregation
-  // (This replaces the GPU kernel launch and cudaDeviceSynchronize)
+  // Execute the OpenMP parallel packet parsing and flow aggregation
   ProcessPacketsOpenMP(packet_data, packets, total_packets, global_flow_table,
                        &stats);
 
-  // 4. Post-process, validate, and print results (mirroring your GPU reporting
-  // logic)
+  // Post-process, validate, and print results
   size_t active_flows = 0;
   size_t packets_in_flows = 0;
   size_t bad_records = 0;
@@ -109,8 +112,20 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "WARNING: %zu flow records failed sanity checks\n",
             bad_records);
   }
+  clock_gettime(CLOCK_MONOTONIC, &chron_e);
 
-  // 5. Cleanup host memory allocations
+  int seconds = chron_e.tv_sec - chron_s.tv_sec;
+  int nano = chron_e.tv_nsec - chron_s.tv_nsec;
+
+  if (nano < 0) {
+    seconds--;
+    nano += 1000000000;
+  }
+  double delta = seconds + (nano / 1e9);
+
+  printf("Took %.12f seconds to execute pipeline\n", delta);
+
+  // Cleanup host memory allocations
   free(global_flow_table);
   free(packet_data);
   free(packets);
