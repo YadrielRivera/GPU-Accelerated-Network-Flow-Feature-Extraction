@@ -36,10 +36,6 @@ typedef struct {
   uint32_t _pad;
 } pkt_info_t;
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 // batches
 extern uint8_t* packet_data;
 extern pkt_info_t* packets;
@@ -54,7 +50,5 @@ int PcapRead(const char* pcap_file, uint32_t file_id);
 
 // Returns 0 on success, non-zero on a fatal error.
 int DatasetRead();
-#ifdef __cplusplus
-}
-#endif
+
 #endif

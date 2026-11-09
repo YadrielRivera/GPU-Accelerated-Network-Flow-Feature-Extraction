@@ -5,9 +5,6 @@
 
 #define DATASET_PATH "../../dataset"
 
-// Set to 0 to stop printing one line per loaded file.
-#define LOG_EACH_FILE 1
-
 // A single captured packet larger than this means a corrupt record.
 #define MAX_PKT_BYTES (1u << 20)
 
@@ -161,7 +158,7 @@ int DatasetRead() {
   }
 
   char filepath[1024];
-  uint32_t file_id = 0;  // counts candidate files, identical on every rank
+  uint32_t file_id = 0;  // counts candidate files
   int loaded = 0, skipped = 0, rc = 0;
 
   for (int i = 0; i < n && rc == 0; i++) {
@@ -185,10 +182,9 @@ int DatasetRead() {
       skipped++;
     } else {
       loaded++;
-#if LOG_EACH_FILE
+
       printf("file_id=%u %s (%zu packets)\n", this_id, name,
              total_packets - before);
-#endif
     }
   }
 
