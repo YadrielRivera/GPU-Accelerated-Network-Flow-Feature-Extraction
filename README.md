@@ -75,7 +75,7 @@ The file id is part of the key because the dataset consists of unrelated capture
 
 Aggregation uses a variant of FNV-1a over the key words, followed by a murmur3 finalizer so that all key bits (for example the upper bits of the source port) influence the table index. The result indexes a one-dimensional flow table of 2^20 slots, and collisions are resolved with linear probing. Slots are claimed without locks: a thread `atomicCAS`es the slot from `EMPTY` to `WRITING`, writes the key, issues a memory fence and publishes `READY`. Other threads wait for `READY`, compare the key, and either update the record or probe to the next slot.
 
-### Feature Reduction and Computations
+### GPU Feature Reduction and Computations
 
 Each flow record holds the following, all accumulated by the parsing kernel with atomics at the moment a packet is matched to its flow:
 
@@ -100,6 +100,12 @@ After the kernel finishes, the table is copied back to the host and checked. Eve
 
 `table_full` is non-zero only if the hash table runs out of slots, in which case a warning is printed. Records with a zero packet count, `min > max` or `first > last` are reported as failed sanity checks.
 
+### CPU Loading & Batching
+
+### CPU Parsing - Extraction, Hashing, and Grouping
+
+### CPU Feature Reduction and Computations
+
 ## Requirements
 * Linux-based OS
 * OpenMPI (with the `mpicxx` compiler wrapper; MPI-3 is needed for per-node GPU selection)
@@ -109,6 +115,7 @@ After the kernel finishes, the table is copied back to the host and checked. Eve
 * A host C++ compiler supported by your CUDA version (e.g. `g++`)
 * git lfs - to pull PCAP data
 * OpenMP (CPU baseline)
+* CMake 3.28.3+ (to cleanly compile cpu baseline)
 * The PCAP files placed in a `dataset` directory at the repository root. The path is hard-coded as `../../dataset`, relative to the directory the program is **run from**, so run it from `gpu/build` as shown below.
 
 ## File Structure
@@ -172,4 +179,15 @@ Counted, but not tracked as flows (reported as `non_flow`):
 
 Note that timestamps are only comparable within one file: some captures use relative timestamps starting near zero, and others have wrong clocks. This is harmless for per-flow durations, since a flow never spans files, but flows from different files should not be ordered by timestamp.
 
-## Useful Scripts
+## Building, Compiling & Running (CPU)
+
+### Locally
+From the root directory
+```bash
+cd cpu
+mkdir build 
+cd build
+cmake -S .. -B .
+make 
+./cpu <number of omp threads>
+```
