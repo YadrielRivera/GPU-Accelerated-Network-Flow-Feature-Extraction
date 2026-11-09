@@ -62,7 +62,6 @@ int main(int argc, char* argv[]) {
   // Execute the OpenMP parallel packet parsing and flow aggregation
   ProcessPacketsOpenMP(packet_data, packets, total_packets, global_flow_table,
                        &stats);
-  clock_gettime(CLOCK_MONOTONIC, &chron_e);
 
   // Post-process, validate, and print results
   size_t active_flows = 0;
@@ -113,6 +112,7 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "WARNING: %zu flow records failed sanity checks\n",
             bad_records);
   }
+  clock_gettime(CLOCK_MONOTONIC, &chron_e);
 
   int seconds = chron_e.tv_sec - chron_s.tv_sec;
   int nano = chron_e.tv_nsec - chron_s.tv_nsec;

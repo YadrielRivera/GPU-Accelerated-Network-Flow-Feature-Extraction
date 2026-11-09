@@ -177,8 +177,23 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  
+  cudaEventRecord(start);
   int rc = RunRank(my_rank, num_procs, threads_per_block);
+  cudaEventRecord(stop);
 
+  cudaEventSynchronize(stop);
+  float milliseconds = 0;
+  cudaEventElapsedTime(&milliseconds, start, stop);
+  float seconds = milliseconds/1000;
+
+   printf("[RANK %d]: Took %.12f seconds to execute pipeline\n", my_rank, seconds);
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
   MPI_Finalize();
   return rc;
 }
