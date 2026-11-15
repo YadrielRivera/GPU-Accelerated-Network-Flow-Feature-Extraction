@@ -102,9 +102,19 @@ After the kernel finishes, the table is copied back to the host and checked. Eve
 
 ### CPU Loading & Batching
 
+The CPU version accepts the same classic Ethernet pcap formats and applies the same timestamp normalization and malformed/truncated-record handling described in [Loading and Batching](#loading-and-batching). Unlike the GPU version, it runs as a single process: it reads the sorted dataset files sequentially, assigns each candidate file a stable `file_id`, and keeps all packet data in host memory. It uses the same flat packet-byte buffer and per-packet metadata records; there is no host-to-device copy.
+
 ### CPU Parsing - Extraction, Hashing, and Grouping
 
+Packet parsing and flow-key construction support the same Ethernet encapsulations, IP versions, transport protocols, and flow identity described in [GPU Parsing - Extraction, Hashing, and Grouping](#gpu-parsing---extraction-hashing-and-grouping). Refer there for the header-walking and flow-key details.
+
+The CPU processes packets with an OpenMP loop using dynamic scheduling (chunks of 256 packets). Each worker parses its packets into a private hash table and keeps private `non_flow`, `malformed`, and `table_full` counters, avoiding synchronization in the packet-processing loop. It uses the same hash function, table size, and linear probing strategy as the GPU. Unlike the GPU's shared table with atomic slot claims, each CPU worker owns its table and updates records directly.
+
 ### CPU Feature Reduction and Computations
+
+The per-flow aggregates are the same as those listed in [GPU Feature Reduction and Computations](#gpu-feature-reduction-and-computations): packet and wire-byte counts, minimum and maximum packet lengths, and first and last timestamps. The CPU updates these fields in each worker's private table, then merges the populated records into a global table inside an OpenMP critical section, combining counts and taking the minimum or maximum as appropriate.
+
+As on the GPU, flow duration is the difference between the last and first timestamps; features requiring packet order or a per-flow distribution are not computed. The CPU also checks flow records and reports packet accounting totals after processing.
 
 ## Requirements
 * Linux-based OS
@@ -124,6 +134,14 @@ root
 ├── LICENSE
 ├── README.md
 ├── cpu
+│   ├── CMakeLists.txt
+│   ├── include
+│   │   ├── pcap_batching.h
+│   │   └── pcap_processing.h
+│   └── src
+│       ├── main.c
+│       ├── pcap_batching.c
+│       └── pcap_processing.c
 ├── dataset/
 └── gpu
     ├── include
@@ -153,6 +171,8 @@ Each MPI rank is assigned to a GPU on its node (`rank % GPUs per node`). If ther
 
 ### Google Colab
 
+The provided [Google Colab notebook](./Final_HPC_Project.ipynb) lets users without a CUDA-capable GPU run the GPU pipeline using a GPU runtime in Google Colab.
+
 ## Dataset
 The PCAP data was obtained from WireShark [SampleCapture](https://wiki.wireshark.org/samplecaptures#sample-captures)
 
@@ -178,6 +198,13 @@ Counted, but not tracked as flows (reported as `non_flow`):
 * Any other EtherType
 
 Note that timestamps are only comparable within one file: some captures use relative timestamps starting near zero, and others have wrong clocks. This is harmless for per-flow durations, since a flow never spans files, but flows from different files should not be ordered by timestamp.
+
+The PCAP files are stored with Git LFS. Install Git LFS, then run these commands from the repository root to download the dataset:
+
+```bash
+git lfs install
+git lfs pull
+```
 
 ## Building, Compiling & Running (CPU)
 
